@@ -5,6 +5,7 @@ import subprocess
 import time
 from tempfile import TemporaryDirectory
 from typing import Final
+import zipfile
 
 from celery.utils.log import get_task_logger
 
@@ -100,10 +101,22 @@ def thor(  # pylint: disable=too-many-arguments
     logger.debug("Creating temporary directory for Thor Lite processing.")
     with TemporaryDirectory(dir=output_path) as temp_dir:
         # Hard link input files for processing
-        logger.debug("Hard linking input files for Thor Lite processing.")
-        for input_file in input_files:
-            filename = os.path.basename(input_file.get("path"))
-            os.link(input_file.get("path"), f"{temp_dir}/{filename}")
+        logger.debug("Preparing input files for Thor Lite processing (extract ZIPs, link others).")
+        for idx, input_file in enumerate(input_files):
+            path = input_file.get("path")
+            if not path or not os.path.exists(path):
+                raise RuntimeError(f"Input file missing or not found: {path}")
+
+            filename = os.path.basename(path)
+            if zipfile.is_zipfile(path):
+                extract_dir_name = f"zip_{idx}_{os.path.splitext(filename)[0] or 'archive'}"
+                extract_dir = os.path.join(temp_dir, extract_dir_name)
+                logger.debug("Extracting ZIP input for Thor Lite", extra={"source": path, "destination": extract_dir})
+                os.makedirs(extract_dir, exist_ok=True)
+                with zipfile.ZipFile(path) as archive:
+                    archive.extractall(extract_dir)
+            else:
+                os.link(path, f"{temp_dir}/{filename}")
 
         # Add the created temporary directory to the command for processing.
         command.append("--path")
