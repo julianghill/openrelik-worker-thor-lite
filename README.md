@@ -48,6 +48,7 @@ Currently the Timesketch converter only supports older log versions. Future idea
 - Update the converter to support `v3.0.0`
 - Add a conversion step to downgrade the JSON schema
 - Pin THOR Lite to 10.7.x when legacy JSON (v1 or v2) is required.
+- Add a user-supplied YARA rules workflow (mount custom folder or per-task upload).
 
 Added to the Soon^tm :)
 

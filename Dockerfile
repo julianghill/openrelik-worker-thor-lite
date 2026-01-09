@@ -26,6 +26,44 @@ RUN curl -o thorlite-linux.zip "https://update1.nextron-systems.com/getupdate.ph
     && rm thorlite-linux.zip \
     && chmod +x thor-lite-linux-64
 # ----------------------------------------------------------------------
+# Install YARA Forge rules (default snapshot)
+# ----------------------------------------------------------------------
+RUN mkdir -p /thor-lite/signatures/custom/yara-forge \
+    && curl -L -o /tmp/yara-forge.zip "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-full.zip" \
+    && unzip /tmp/yara-forge.zip -d /thor-lite/signatures/custom/yara-forge \
+    && rm /tmp/yara-forge.zip \
+    && python3 - <<'PY'
+import hashlib
+import os
+import shutil
+
+custom_dirs = ["/thor-lite/signatures/custom/yara", "/thor-lite/custom-signatures/yara"]
+clean_dirs = ["/thor-lite/signatures/custom", "/thor-lite/custom-signatures"] + custom_dirs
+forge_dir = "/thor-lite/signatures/custom/yara-forge"
+prefix = "yara_forge_"
+
+for custom_dir in clean_dirs:
+    os.makedirs(custom_dir, exist_ok=True)
+    for name in os.listdir(custom_dir):
+        if name.startswith(prefix) and name.lower().endswith((".yar", ".yara")):
+            os.remove(os.path.join(custom_dir, name))
+
+count = 0
+for root, _, files in os.walk(forge_dir):
+    for filename in files:
+        if not filename.lower().endswith((".yar", ".yara")):
+            continue
+        source_path = os.path.join(root, filename)
+        rel_path = os.path.relpath(source_path, forge_dir)
+        digest = hashlib.sha1(rel_path.encode("utf-8")).hexdigest()[:12]
+        dest_name = f"{prefix}{digest}_{filename}"
+        for custom_dir in custom_dirs:
+            shutil.copy2(source_path, os.path.join(custom_dir, dest_name))
+        count += 1
+
+print(f"Flattened {count} YARA Forge rules into {', '.join(custom_dirs)}")
+PY
+# ----------------------------------------------------------------------
 
 # Configure poetry
 ENV POETRY_NO_INTERACTION=1 \

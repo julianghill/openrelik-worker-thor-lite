@@ -1,9 +1,12 @@
 # Copyright 2025 Nextron Systems GmbH
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import time
+import urllib.request
 from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 from typing import Final
@@ -41,10 +44,35 @@ TASK_METADATA = {
             "type": "checkbox",
             "required": False,
         },
+        {
+            "name": "custom_only",
+            "label": "Run custom YARA and Filescan",
+            "description": "Run Filescan with custom signatures only (equivalent to --module Filescan --customonly).",
+            "type": "checkbox",
+            "required": False,
+        },
+        {
+            "name": "download_yara_forge",
+            "label": "Update YARA Forge rules",
+            "description": "Download and replace the bundled YARA Forge rules with the latest release.",
+            "type": "checkbox",
+            "required": False,
+        },
     ],
 }
 
 logger = get_task_logger(__name__)
+
+CUSTOM_YARA_DIRS = [
+    "/thor-lite/signatures/custom/yara",
+    "/thor-lite/custom-signatures/yara",
+]
+CUSTOM_YARA_CLEAN_DIRS = [
+    "/thor-lite/signatures/custom",
+    "/thor-lite/custom-signatures",
+] + CUSTOM_YARA_DIRS
+YARA_FORGE_DIR = "/thor-lite/signatures/custom/yara-forge"
+YARA_FORGE_PREFIX = "yara_forge_"
 
 
 def _tail_last_line(path: str, max_bytes: int = 4096) -> str | None:
@@ -65,6 +93,64 @@ def _tail_last_line(path: str, max_bytes: int = 4096) -> str | None:
         if line:
             return line
     return None
+
+
+def _consume_log_updates(path: str, offset: int) -> tuple[int, int]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            data = handle.read()
+            new_offset = handle.tell()
+    except FileNotFoundError:
+        return offset, 0
+
+    if not data:
+        return new_offset, 0
+
+    added_hits = data.lower().count("yara rule")
+    return new_offset, added_hits
+
+
+def _safe_extract_zip(zip_file: zipfile.ZipFile, destination: str) -> None:
+    destination = os.path.abspath(destination)
+    for member in zip_file.namelist():
+        member_path = os.path.abspath(os.path.join(destination, member))
+        if not member_path.startswith(destination + os.sep) and member_path != destination:
+            raise ValueError(f"Zip member would escape destination: {member}")
+    zip_file.extractall(destination)
+
+
+def _is_yara_file(filename: str) -> bool:
+    return filename.lower().endswith((".yar", ".yara"))
+
+
+def _flatten_yara_forge_rules() -> int:
+    if not os.path.isdir(YARA_FORGE_DIR):
+        return 0
+
+    file_entries = []
+    for root, _, files in os.walk(YARA_FORGE_DIR):
+        for filename in files:
+            if not _is_yara_file(filename):
+                continue
+            source_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(source_path, YARA_FORGE_DIR)
+            digest = hashlib.sha1(rel_path.encode("utf-8")).hexdigest()[:12]
+            dest_name = f"{YARA_FORGE_PREFIX}{digest}_{filename}"
+            file_entries.append((source_path, dest_name))
+
+    for custom_dir in CUSTOM_YARA_CLEAN_DIRS:
+        os.makedirs(custom_dir, exist_ok=True)
+        for name in os.listdir(custom_dir):
+            if name.startswith(YARA_FORGE_PREFIX) and _is_yara_file(name):
+                os.remove(os.path.join(custom_dir, name))
+
+    for custom_dir in CUSTOM_YARA_DIRS:
+        os.makedirs(custom_dir, exist_ok=True)
+        for source_path, dest_name in file_entries:
+            shutil.copy2(source_path, os.path.join(custom_dir, dest_name))
+
+    return len(file_entries)
 
 
 def _coerce_bool(value: str | None, default: bool = False) -> bool:
@@ -199,6 +285,43 @@ def _update_signatures(task, task_config: dict | None) -> None:
     task.send_event("task-progress", data={"message": "Signature update complete."})
 
 
+def _download_yara_forge(task, task_config: dict | None) -> None:
+    raw_download = _first_value((task_config or {}).get("download_yara_forge"))
+    if not _coerce_bool(raw_download, default=False):
+        return
+
+    url = "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-full.zip"
+    dest_dir = YARA_FORGE_DIR
+    parent_dir = os.path.dirname(dest_dir)
+    os.makedirs(parent_dir, exist_ok=True)
+
+    task.send_event("task-progress", data={"message": "Updating YARA Forge rules..."})
+    with TemporaryDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, "yara-forge.zip")
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response, open(
+                zip_path, "wb"
+            ) as handle:
+                shutil.copyfileobj(response, handle)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to download YARA Forge rules: {exc}") from exc
+
+        extract_dir = os.path.join(temp_dir, "extract")
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                _safe_extract_zip(archive, extract_dir)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to extract YARA Forge rules: {exc}") from exc
+
+        if os.path.isdir(dest_dir):
+            shutil.rmtree(dest_dir)
+        shutil.move(extract_dir, dest_dir)
+
+    _flatten_yara_forge_rules()
+    task.send_event("task-progress", data={"message": "YARA Forge rules updated."})
+
+
 @celery.task(bind=True, name=TASK_NAME, metadata=TASK_METADATA)
 def thor(  # pylint: disable=too-many-arguments
     self,
@@ -254,6 +377,10 @@ def thor(  # pylint: disable=too-many-arguments
         _first_value((task_config or {}).get("json_v2")),
         default=True,
     )
+    custom_only = _coerce_bool(
+        _first_value((task_config or {}).get("custom_only")),
+        default=False,
+    )
 
     # Thor Lite command
     command = [
@@ -270,6 +397,9 @@ def thor(  # pylint: disable=too-many-arguments
         "--rebase-dir",
         output_path,
     ]
+    if custom_only:
+        command.extend(["--module", "Filescan"])
+        command.append("--customonly")
     if json_v2_enabled:
         command.append("--jsonv2")
 
@@ -283,6 +413,14 @@ def thor(  # pylint: disable=too-many-arguments
         self.send_event("task-progress", data={"message": signature_status_message})
 
     _update_signatures(self, task_config)
+    _download_yara_forge(self, task_config)
+    forge_count = _flatten_yara_forge_rules()
+    custom_yara_loaded = forge_count
+    if custom_yara_loaded:
+        self.send_event(
+            "task-progress",
+            data={"message": f"Custom YARA rules loaded: {custom_yara_loaded}"},
+        )
 
     signature_status = _get_signature_status()
     signature_status_message = _format_signature_status(signature_status)
@@ -346,9 +484,13 @@ def thor(  # pylint: disable=too-many-arguments
         ) as proc:
             logger.debug("Waiting for Thor to finish")
             scan_start = time.monotonic()
+            log_offset = 0
+            yara_hits = 0
             while proc.poll() is None:
                 elapsed_s = int(time.monotonic() - scan_start)
                 last_line = _tail_last_line(txt_log.path)
+                log_offset, added_hits = _consume_log_updates(txt_log.path, log_offset)
+                yara_hits += added_hits
                 header = f"Status: THOR Lite scanning (elapsed {elapsed_s}s)"
                 log_summary = _summarize_log_line(last_line)
                 signature_line = (
@@ -356,8 +498,14 @@ def thor(  # pylint: disable=too-many-arguments
                     if signature_status_message
                     else None
                 )
+                custom_line = None
+                if custom_only:
+                    custom_line = (
+                        "Custom YARA + Filescan: enabled "
+                        f"(rules loaded: {custom_yara_loaded}, hits: {yara_hits})"
+                    )
                 log_line = f"Last log: {log_summary}" if log_summary else None
-                message_lines = [signature_line, header, log_line]
+                message_lines = [signature_line, custom_line, header, log_line]
                 message = "\n".join(line for line in message_lines if line)
                 self.send_event(
                     "task-progress",
