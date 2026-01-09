@@ -1,0 +1,65 @@
+name: Create and publish a Docker image
+
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Verify GHCR PAT is available
+        shell: bash
+        env:
+          GHCR_PAT_PRIMARY: ${{ secrets.GHCR_PAT }}
+          GHCR_PAT_ALT: ${{ secrets.GCHR_PAT }}
+        run: |
+          PASS="${GHCR_PAT_PRIMARY:-$GHCR_PAT_ALT}"
+          if [ -z "$PASS" ]; then
+            echo "ERROR: secrets.GHCR_PAT (preferred) or secrets.GCHR_PAT is not set or not available to this workflow run."
+            echo "Add a repo/org secret named GHCR_PAT with write:packages scope, or run from a branch where secrets are exposed."
+            exit 1
+          fi
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT || secrets.GCHR_PAT }}
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
