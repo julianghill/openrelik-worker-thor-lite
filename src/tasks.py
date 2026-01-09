@@ -34,6 +34,13 @@ TASK_METADATA = {
             "type": "checkbox",
             "required": False,
         },
+        {
+            "name": "json_v2",
+            "label": "Use JSON v2 output",
+            "description": "Enable THOR JSON v2 format for easier parsing.",
+            "type": "checkbox",
+            "required": False,
+        },
     ],
 }
 
@@ -243,6 +250,11 @@ def thor(  # pylint: disable=too-many-arguments
         data_type="openrelik:worker:thor-lite:txt_log",
     )
 
+    json_v2_enabled = _coerce_bool(
+        _first_value((task_config or {}).get("json_v2")),
+        default=True,
+    )
+
     # Thor Lite command
     command = [
         "/thor-lite/thor-lite-linux-64",
@@ -258,6 +270,8 @@ def thor(  # pylint: disable=too-many-arguments
         "--rebase-dir",
         output_path,
     ]
+    if json_v2_enabled:
+        command.append("--jsonv2")
 
     # Debugging information
     if not os.getenv("THOR_LITE_WORKER_DEBUG"):
